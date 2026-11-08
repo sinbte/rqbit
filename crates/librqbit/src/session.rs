@@ -1008,6 +1008,7 @@ impl Session {
                 let rm = self.resolving_magnets.lock().get(&h.info_hash).cloned();
                 if let Some(rm) = rm {
                     let _ = rm.addr_tx.send(addr);
+                    let info_hash = h.info_hash;
                     // Use this very connection for ut_metadata: dialing back usually fails (NAT).
                     let incoming = CheckedIncomingConnection {
                         addr,
@@ -1018,7 +1019,6 @@ impl Session {
                         read_buf,
                     };
                     let sess = self.clone();
-                    let info_hash = h.info_hash;
                     tokio::spawn(async move {
                         match crate::peer_info_reader::read_metainfo_from_incoming(
                             incoming,
@@ -1039,8 +1039,7 @@ impl Session {
                         }
                     });
                     bail!(
-                        "incoming peer {addr} for magnet {:?} still resolving; using it to fetch metadata",
-                        h.info_hash
+                        "incoming peer {addr} for magnet {info_hash:?} still resolving; using it to fetch metadata"
                     );
                 }
                 bail!("didn't find a matching torrent {:?}", h.info_hash);
