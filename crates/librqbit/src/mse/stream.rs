@@ -96,30 +96,32 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for Rc4Writer<W> {
             return Poll::Ready(Ok(0));
         }
 
-        // If a previous poll left ciphertext pending (this is a retry after a
-        // Pending or partial flush), flush it and report the logical write as
-        // complete without re-encrypting the caller's data.
+        // Ciphertext from an earlier write may still be buffered (the inner
+        // writer accepted only part of it). Drain that first; while it is not
+        // fully flushed we accept no new data, so `data` is never consumed
+        // twice and the call is cancellation-safe: a caller that gives up on
+        // a Pending write and later writes different data loses nothing and
+        // the RC4 keystream stays aligned with what was actually accepted.
         if !this.pending.is_empty() {
             match this.flush_pending(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Ready(Ok(())) => return Poll::Ready(Ok(data.len())),
+                Poll::Ready(Ok(())) => {}
             }
         }
 
-        // Encrypt the whole buffer once, buffer the ciphertext, then flush it.
-        // The pending buffer is empty here (a non-empty one was flushed and
-        // returned above), so hand its allocation over and reuse it: the
-        // steady state costs no allocation per write.
+        // Encrypt the whole buffer once and account for it immediately: the
+        // bytes are consumed (Ok(len)) even if the inner writer takes the
+        // ciphertext later; poll_flush / the next poll_write drain it. The
+        // pending buffer is empty here, so reuse its allocation.
         let mut encrypted = std::mem::take(&mut this.pending);
         debug_assert!(encrypted.is_empty());
         encrypted.extend_from_slice(data);
         this.rc4.apply_keystream(&mut encrypted);
         this.pending = encrypted;
         match this.flush_pending(cx) {
-            Poll::Pending => Poll::Pending,
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Ready(Ok(())) => Poll::Ready(Ok(data.len())),
+            Poll::Pending | Poll::Ready(Ok(())) => Poll::Ready(Ok(data.len())),
         }
     }
 

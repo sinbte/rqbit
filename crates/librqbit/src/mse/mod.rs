@@ -97,7 +97,8 @@ impl<R: AsyncRead + Unpin> AsyncRead for PrefixReader<R> {
 #[allow(clippy::large_enum_variant)]
 pub enum IncomingOutcome<R, W> {
     Encrypted {
-        read: Rc4Reader<R>,
+        /// RC4 stream; any IA bytes beyond the BT handshake are replayed first.
+        read: PrefixReader<Rc4Reader<R>>,
         write: Rc4Writer<W>,
         handshake_bytes: Vec<u8>,
         info_hash: [u8; 20],
@@ -445,12 +446,15 @@ where
 
     let mut ia_length = [0u8; 2];
     read_encrypted(&mut read, &mut decrypt, &mut ia_length).await?;
+    // IA (initial payload) may carry more than the 68-byte BT handshake: some
+    // clients append bitfield / extended handshake right away. Accept any
+    // u16 length; bytes beyond the handshake are replayed to the reader.
     let ia_length = u16::from_be_bytes(ia_length) as usize;
-    if ia_length > BT_HANDSHAKE_LEN {
-        bail!("MSE IA length exceeds {BT_HANDSHAKE_LEN} bytes");
-    }
-    let mut handshake_bytes = vec![0u8; ia_length];
-    read_encrypted(&mut read, &mut decrypt, &mut handshake_bytes).await?;
+    let mut ia = vec![0u8; ia_length];
+    read_encrypted(&mut read, &mut decrypt, &mut ia).await?;
+    let extra = if ia.len() > BT_HANDSHAKE_LEN { ia.split_off(BT_HANDSHAKE_LEN) } else { Vec::new() };
+    let mut handshake_bytes = ia;
+    let ia_length = handshake_bytes.len();
 
     // Respond before waiting for the rest of the BT handshake. An initiator
     // with IA=0 may not send that data until PE4 selects the cipher.
@@ -473,7 +477,7 @@ where
 
     trace!("MSE incoming handshake complete, RC4 established");
     Ok(IncomingOutcome::Encrypted {
-        read: Rc4Reader::new(read, decrypt),
+        read: PrefixReader::new(extra, Rc4Reader::new(read, decrypt)),
         write: Rc4Writer::new(write, encrypt),
         handshake_bytes,
         info_hash,
