@@ -114,7 +114,7 @@ pub struct Session {
     /// peer addresses into the metadata fetcher. Incoming connections for such a
     /// hash would otherwise be dropped ("didn't find a matching torrent") even though
     /// they are exactly the peers that can give us the metadata.
-    resolving_magnets: parking_lot::Mutex<HashMap<Id20, tokio::sync::mpsc::UnboundedSender<SocketAddr>>>,
+    resolving_magnets: parking_lot::Mutex<HashMap<Id20, ResolvingMagnet>>,
     pub(crate) bitv_factory: Arc<dyn BitVFactory>,
     spawner: BlockingSpawner,
 
@@ -1005,11 +1005,41 @@ impl Session {
             None => {
                 // A peer dialing us for a magnet we are still resolving: it very likely has the
                 // metadata. Hand its address to the resolver (which dials back) and close this one.
-                let tx = self.resolving_magnets.lock().get(&h.info_hash).cloned();
-                if let Some(tx) = tx {
-                    let _ = tx.send(addr);
+                let rm = self.resolving_magnets.lock().get(&h.info_hash).cloned();
+                if let Some(rm) = rm {
+                    let _ = rm.addr_tx.send(addr);
+                    // Use this very connection for ut_metadata: dialing back usually fails (NAT).
+                    let incoming = CheckedIncomingConnection {
+                        addr,
+                        reader,
+                        writer,
+                        kind,
+                        handshake: h,
+                        read_buf,
+                    };
+                    let sess = self.clone();
+                    let info_hash = h.info_hash;
+                    tokio::spawn(async move {
+                        match crate::peer_info_reader::read_metainfo_from_incoming(
+                            incoming,
+                            sess.peer_id,
+                            info_hash,
+                            Some(sess.merge_peer_opts(None)),
+                            sess.spawner.clone(),
+                            sess.connector.clone(),
+                            sess.client_name_and_version.clone(),
+                        )
+                        .await
+                        {
+                            Ok(r) => {
+                                debug!(?addr, ?info_hash, "got magnet metadata over incoming connection");
+                                let _ = rm.result_tx.send(r);
+                            }
+                            Err(e) => debug!(?addr, ?info_hash, "incoming metadata fetch failed: {e:#}"),
+                        }
+                    });
                     bail!(
-                        "incoming peer {addr} for magnet {:?} still resolving; queued it for metadata fetch",
+                        "incoming peer {addr} for magnet {:?} still resolving; using it to fetch metadata",
                         h.info_hash
                     );
                 }
@@ -1324,18 +1354,40 @@ impl Session {
                     let peer_rx = make_peer_rx().context(
                         "no known way to resolve peers (no DHT, no trackers, no initial_peers)",
                     )?;
-                    // Peers that dial us while we resolve get fed into the same stream.
-                    let (incoming_tx, incoming_rx) = tokio::sync::mpsc::unbounded_channel::<SocketAddr>();
-                    self.resolving_magnets.lock().insert(info_hash, incoming_tx);
+                    // Peers that dial us while we resolve: their addresses join the dial stream, and
+                    // the connections themselves are used for ut_metadata (see check_incoming_connection).
+                    let (addr_tx, addr_rx) = tokio::sync::mpsc::unbounded_channel::<SocketAddr>();
+                    let (result_tx, mut result_rx) =
+                        tokio::sync::mpsc::unbounded_channel::<crate::peer_info_reader::TorrentAndInfoBytes>();
+                    self.resolving_magnets
+                        .lock()
+                        .insert(info_hash, ResolvingMagnet { addr_tx, result_tx });
                     let peer_rx: PeerStream = Box::pin(merge_streams(
                         peer_rx,
-                        tokio_stream::wrappers::UnboundedReceiverStream::new(incoming_rx),
+                        tokio_stream::wrappers::UnboundedReceiverStream::new(addr_rx),
                     ));
                     let mut magnet_peer_opts = opts.peer_opts.unwrap_or_default();
                     magnet_peer_opts.mse_mode = self.mse_mode;
-                    let resolved = self
-                        .resolve_magnet(info_hash, peer_rx, &trackers, Some(magnet_peer_opts))
-                        .await;
+                    let mut resolve_fut =
+                        Box::pin(self.resolve_magnet(info_hash, peer_rx, &trackers, Some(magnet_peer_opts)));
+                    let resolved = tokio::select! {
+                        r = &mut resolve_fut => r,
+                        Some((info, info_bytes)) = result_rx.recv() => {
+                            // Metadata came over an incoming connection; the outgoing resolver (and its
+                            // peer stream) is dropped, so open a fresh peer stream for the live torrent.
+                            let info = info.validate()?;
+                            let metadata = TorrentMetadata::new(
+                                info,
+                                torrent_file_from_info_bytes(info_bytes.as_ref(), &trackers)?,
+                                info_bytes.0,
+                            )?;
+                            drop(resolve_fut);
+                            match make_peer_rx() {
+                                Some(peer_rx) => Ok(ResolveMagnetResult { metadata, peer_rx, seen_peers: Vec::new() }),
+                                None => bail!("no way to discover peers after resolving magnet"),
+                            }
+                        }
+                    };
                     self.resolving_magnets.lock().remove(&info_hash);
                     let resolved_magnet = resolved?;
 
@@ -1801,6 +1853,15 @@ impl Session {
 
         Ok((torrent, handle))
     }
+}
+
+/// A magnet whose metadata is being resolved (see `Session::resolving_magnets`).
+#[derive(Clone)]
+struct ResolvingMagnet {
+    /// addresses to dial for metadata (DHT/tracker stream is merged with this)
+    addr_tx: tokio::sync::mpsc::UnboundedSender<SocketAddr>,
+    /// metadata obtained over an incoming connection (first one wins)
+    result_tx: tokio::sync::mpsc::UnboundedSender<crate::peer_info_reader::TorrentAndInfoBytes>,
 }
 
 pub(crate) struct ResolveMagnetResult {

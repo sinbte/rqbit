@@ -74,6 +74,51 @@ pub(crate) async fn read_metainfo_from_peer(
     }
 }
 
+/// Same as `read_metainfo_from_peer`, but over an incoming connection whose BT handshake
+/// has already been read (a peer that dialed *us* for a magnet we are still resolving).
+/// Such peers are often unreachable by dialing back (NAT), so the live connection is used.
+pub(crate) async fn read_metainfo_from_incoming(
+    incoming: crate::session::CheckedIncomingConnection,
+    peer_id: Id20,
+    info_hash: Id20,
+    peer_connection_options: Option<PeerConnectionOptions>,
+    spawner: BlockingSpawner,
+    connector: Arc<StreamConnector>,
+    client_name_and_version: String,
+) -> anyhow::Result<TorrentAndInfoBytes> {
+    let addr = incoming.addr;
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel::<
+        Result<(TorrentMetaV1Info<ByteBufOwned>, ByteBufOwned), bencode::DeserializeError>,
+    >();
+    let (writer_tx, writer_rx) = tokio::sync::mpsc::unbounded_channel::<WriterRequest>();
+    let handler = Handler {
+        addr,
+        info_hash,
+        writer_tx,
+        result_tx: Mutex::new(Some(result_tx)),
+        locked: RwLock::new(None),
+        client_name_and_version,
+    };
+    let connection = PeerConnection::new(
+        addr,
+        info_hash,
+        peer_id,
+        handler,
+        peer_connection_options,
+        spawner,
+        connector,
+    );
+    let (_, brx) = tokio::sync::broadcast::channel(1);
+    let connection_runner = async move { connection.manage_peer_incoming(writer_rx, incoming, brx).await };
+    tokio::select! {
+        result = result_rx => Ok(result??),
+        whatever = connection_runner => match whatever {
+            Ok(_) => anyhow::bail!("connection runner completed first"),
+            Err(e) => Err(e.into())
+        }
+    }
+}
+
 #[derive(Default)]
 struct HandlerLocked {
     metadata_size: u32,
