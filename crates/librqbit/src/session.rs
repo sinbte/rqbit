@@ -110,6 +110,11 @@ pub struct Session {
     // Core state and services
     pub(crate) db: RwLock<SessionDatabase>,
     next_id: AtomicUsize,
+    /// Magnets whose metadata is still being resolved: info_hash → sender feeding
+    /// peer addresses into the metadata fetcher. Incoming connections for such a
+    /// hash would otherwise be dropped ("didn't find a matching torrent") even though
+    /// they are exactly the peers that can give us the metadata.
+    resolving_magnets: parking_lot::Mutex<HashMap<Id20, tokio::sync::mpsc::UnboundedSender<SocketAddr>>>,
     pub(crate) bitv_factory: Arc<dyn BitVFactory>,
     spawner: BlockingSpawner,
 
@@ -819,6 +824,7 @@ impl Session {
                 peer_limit: opts.peer_limit,
                 client_name_and_version,
                 mse_mode: opts.mse_mode,
+                resolving_magnets: Default::default(),
 
                 #[cfg(feature = "disable-upload")]
                 _disable_upload: opts.disable_upload,
@@ -987,14 +993,29 @@ impl Session {
             bail!("seems like we are connecting to ourselves, ignoring");
         }
 
-        let (id, torrent) = self
+        let found = self
             .db
             .read()
             .torrents
             .iter()
             .find(|(_, t)| t.info_hash() == h.info_hash)
-            .map(|(id, t)| (*id, t.clone()))
-            .with_context(|| format!("didn't find a matching torrent {:?}", h.info_hash))?;
+            .map(|(id, t)| (*id, t.clone()));
+        let (id, torrent) = match found {
+            Some(f) => f,
+            None => {
+                // A peer dialing us for a magnet we are still resolving: it very likely has the
+                // metadata. Hand its address to the resolver (which dials back) and close this one.
+                let tx = self.resolving_magnets.lock().get(&h.info_hash).cloned();
+                if let Some(tx) = tx {
+                    let _ = tx.send(addr);
+                    bail!(
+                        "incoming peer {addr} for magnet {:?} still resolving; queued it for metadata fetch",
+                        h.info_hash
+                    );
+                }
+                bail!("didn't find a matching torrent {:?}", h.info_hash);
+            }
+        };
 
         let live = torrent
             .live_wait_initializing(Duration::from_secs(5))
@@ -1303,11 +1324,20 @@ impl Session {
                     let peer_rx = make_peer_rx().context(
                         "no known way to resolve peers (no DHT, no trackers, no initial_peers)",
                     )?;
+                    // Peers that dial us while we resolve get fed into the same stream.
+                    let (incoming_tx, incoming_rx) = tokio::sync::mpsc::unbounded_channel::<SocketAddr>();
+                    self.resolving_magnets.lock().insert(info_hash, incoming_tx);
+                    let peer_rx: PeerStream = Box::pin(merge_streams(
+                        peer_rx,
+                        tokio_stream::wrappers::UnboundedReceiverStream::new(incoming_rx),
+                    ));
                     let mut magnet_peer_opts = opts.peer_opts.unwrap_or_default();
                     magnet_peer_opts.mse_mode = self.mse_mode;
-                    let resolved_magnet = self
+                    let resolved = self
                         .resolve_magnet(info_hash, peer_rx, &trackers, Some(magnet_peer_opts))
-                        .await?;
+                        .await;
+                    self.resolving_magnets.lock().remove(&info_hash);
+                    let resolved_magnet = resolved?;
 
                     // Add back seen_peers into the peer stream, as we consumed some peers
                     // while resolving the magnet.
